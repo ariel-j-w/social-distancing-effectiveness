@@ -1,0 +1,390 @@
+---
+title: "Social Distancing Effectiveness"
+output: html_notebook
+---
+
+This file endeavors to visualize the effectiveness of social distancing measures against the COVID-19 pandemic. We perform k-means cluster analysis to identify classifications of how strict social distancing government mandates are in each of the 50 U.S. States. We then use these groupings to visualize coronavirus cases and deaths in each state.
+
+```{r}
+library(tidyverse)
+library(grid)
+library(gridExtra)
+library(ggplot2)
+library(plotly)
+library(ggpubr)
+library(usmap)
+library(fiftystater)
+```
+
+# Social Distancing Data Sources
+
+To begin our analysis of the effectiveness of social distancing, we look at a dataset which reports information about the measures mandated in each of the 50 U.S. States. [KFF](https://www.kff.org/coronavirus-covid-19/issue-brief/state-data-and-policy-actions-to-address-coronavirus/#socialdistancing) has a dataset with extensive records detailing this information. Let's begin by loading in this dataset. It contains a lot of columns with a lot of information, but for our purposes we're going to focus on Location, Stay at Home Order, Large Gatherings Ban, and Restaurant Limits. These 3 categories were selected over the others based on the magnitude of available data, variance between states, and relevance to enforcing social distancing. Please note that while this dataset was grabbed from KFF as linked, the csv was mildly massaged before loading into R (removing metadata lines, footnotes, ensuring consistent number of columns in each row). This data was downloaded on and accurate as of May 12, 2020.
+
+```{r}
+social_distancing <- as.data.frame(read_csv('./social_distancing.csv'))
+row.names(social_distancing) <- social_distancing$Location
+social_distancing <- social_distancing %>% select('Location','Stay at Home Order','Large Gatherings Ban','Restaurant Limits')
+social_distancing[1:10,]
+```
+
+
+## Transforming Categorical Variables
+
+Our goal is to use k-means clustering analysis to identify classifications of how strict each state is with their social distancing policies. However, our data in it's current state contains only categorical variables, and k-means clustering requires the use of numeric variables. Luckily, the categories we have are inherently ordinal, so let's define a mapping for each variable to become "numerical". We will take the categories for each variable, and assign them an integer value between 0 and 10, loosely defined as 0 being the "least strict" and 10 being the "most strict". Keeping all 3 predictor variables on a similar scale allows k-means to effectively analyze clusters without allowing any single variable to overrun the analysis. 
+
+As a note, this type of transformation is highly subjective: more of an art form than a science. A different analyst may have different ideas about how to assign weight to the levels of each factor. Regardless, perhaps the most important principles to follow during this process is to keep each variable on scales of similar magnitude.
+
+### Transforming "Stay at Home Order"
+```{r}
+unique(social_distancing[,'Stay at Home Order'])
+```
+
+We can see here that there are 4 categories of responses to the "Stay at Home" variable: Lifted, High-Risk Groups, Rolled Back to High Risk Groups, and Statewide. There is also a "-" response, indicating some type of missing value. Which states only record "-" for Stay at Home Order?
+```{r}
+filter(social_distancing,`Stay at Home Order`=='-')
+```
+
+Some [outside research](https://www.cnn.com/2020/04/13/politics/asa-hutchison-arkansas-coronavirus/index.html) indicates that the value is missing because these states actually have **no stay at home order**! This must be the meaning of "-". Turns out then, we actually have 5 categories for this variable. 
+
+This is where it becomes subjective, but we will do our best to create a fair mapping between this somewhat-ordinal data and a numerical 0-10 scale. Below we assign each category of "Stay at Home Order" to a numerical value, and create a new column to record these.
+```{r}
+# Rolled Back to High Risk Groups is classified as more strict than High-Risk groups
+# because states in this classification at one point had statewide stay at home orders
+
+social_distancing$stay_home <- ifelse(social_distancing$`Stay at Home Order`=='-', 0,
+                               ifelse(social_distancing$`Stay at Home Order`=='Lifted', 3,
+                               ifelse(social_distancing$`Stay at Home Order`=='High-Risk Groups', 5,
+                               ifelse(social_distancing$`Stay at Home Order`=='Rolled Back to High Risk Groups', 8,
+                               ifelse(social_distancing$`Stay at Home Order`=='Statewide', 10,
+                                                                                          NA)))))
+social_distancing
+```
+
+### Transforming "Large Gatherings Ban"
+
+We will follow similar steps to transform the "Large Gatherings Ban" predictor variable.
+```{r}
+unique(social_distancing[,'Large Gatherings Ban'])
+```
+
+Most of these categories seem to make sense and are fairly ordinal. However, two of the categories are unclear in their meaning: '-' and 'Other'. Let's look at which states fall into these categories and see if we can learn more information.
+```{r}
+filter(social_distancing, `Large Gatherings Ban`=='-')
+```
+
+Doing some outside research, it appears [Minnesota has banned large gatherings for high school graduation ceremonies](https://www.minnpost.com/health/2020/05/the-daily-coronavirus-update-minnesota-surpasses-10000-confirmed-cases-state-bans-large-in-person-graduation-ceremonies/), but has made no general *mandates* for large gatherings outside of that, only suggestions. It appears North Dakota has [not made a mandate](https://www.aarp.org/politics-society/government-elections/info-2020/coronavirus-state-restrictions.html) concerning large gatherings.
+
+```{r}
+filter(social_distancing, `Large Gatherings Ban`=='Other')
+```
+
+Research indicates that [Connecticut is banning gatherings with >5 people](https://www.ctpost.com/news/coronavirus/article/Gov-Lamont-wants-disaster-declaration-from-Trump-15159208.php), [Florida prohibits gatherings of 10+ on beaches only](https://www.post-gazette.com/news/nation/2020/03/17/Florida-beaches-restaurants-bars-schools-students-governor-coronavirus/stories/202003170202), and [Rhode Island bans gatherings of 10+](https://www.ri.gov/press/view/38033).
+
+Based on these findings for MN, ND, CT, FL, and RI, we define new categories of "None", "Special types of gatherings prohibited", and ">5 People Prohibited". We will then re-classify the "Large Gatherings Ban" attribute in ways that make sense for these 5 states.
+```{r}
+social_distancing['Minnesota', 'Large Gatherings Ban'] <- 'Special types of gatherings prohibited'
+social_distancing['North Dakota', 'Large Gatherings Ban'] <- 'None'
+social_distancing['Connecticut', 'Large Gatherings Ban'] <- '>5 People Prohibited'
+social_distancing['Florida', 'Large Gatherings Ban'] <- 'Special types of gatherings prohibited'
+social_distancing['Rhode Island', 'Large Gatherings Ban'] <- '>10 People Prohibited'
+```
+
+Let's look at the unique levels of this factor one more time to make sure nothing went awry.
+```{r}
+unique(social_distancing[,'Large Gatherings Ban'])
+```
+
+Great! Now let's go ahead and assign numerical scores to each of these levels, creating a new column in our dataframe to store those values. Notice that 'Expanded to >25 People Prohibited' and 'Expanded to 25+ People Prohibited' are two different labels, but we will treat these as equally strict categories.
+```{r}
+social_distancing$large_gatherings <- ifelse(social_distancing$`Large Gatherings Ban`=='None', 0,
+                                      ifelse(social_distancing$`Large Gatherings Ban`=='Lifted', 3,
+                                      ifelse(social_distancing$`Large Gatherings Ban`=='Special types of gatherings prohibited',3,
+                                      ifelse(social_distancing$`Large Gatherings Ban`=='Expanded to 50+ People Prohibited', 4,
+                                      ifelse(social_distancing$`Large Gatherings Ban`=='Expanded to 25+ People Prohibited', 5,
+                                      ifelse(social_distancing$`Large Gatherings Ban`=='Expanded to >25 People Prohibited', 5,
+                                      ifelse(social_distancing$`Large Gatherings Ban`=='Expanded to 20+ People Prohibited', 6,
+                                      ifelse(social_distancing$`Large Gatherings Ban`=='Expanded to >10 People Prohibited', 7,
+                                      ifelse(social_distancing$`Large Gatherings Ban`=='>10 People Prohibited', 8,
+                                      ifelse(social_distancing$`Large Gatherings Ban`=='>5 People Prohibited', 9,
+                                      ifelse(social_distancing$`Large Gatherings Ban`=='All Gatherings Prohibited', 10,
+                                                                                                                    NA)))))))))))
+social_distancing
+```
+
+### Transforming "Restaurant Limits"
+
+Finally, we transform the "Restaurant Limits" predictor variable.
+```{r}
+unique(social_distancing[,'Restaurant Limits'])
+```
+
+```{r}
+filter(social_distancing, `Restaurant Limits`=='-')
+```
+
+South Dakota is the only state without a clearly defined entry for Restaurant Limits, but since there is [no statewide ban on restaurants in South Dakota](https://www.keloland.com/keloland-com-original/who-has-the-authority-to-close-restaurants-and-bars-in-south-dakota-state-and-local-leaders-point-at-each-other/), we will just assign the "-" value a very low score when we create the numeric columns.
+```{r}
+social_distancing$restaurants <- ifelse(social_distancing$`Restaurant Limits`=='-', 0,
+                                 ifelse(social_distancing$`Restaurant Limits`=='Limited Dine-in Service', 2,
+                                 ifelse(social_distancing$`Restaurant Limits`=='Reopened to Dine-in Service', 4,
+                                 ifelse(social_distancing$`Restaurant Limits`=='Reopened to Dine-in Service with Capacity Limits', 7,
+                                 ifelse(social_distancing$`Restaurant Limits`=='Closed Except for Takeout/Delivery', 10,
+                                                                                          NA)))))
+social_distancing
+```
+
+# K-Means Clustering
+
+Now that our dataset is in a helpfully numeric form, we can perform k-means clustering analysis. For the sake of convenience, let's define a subset of the data that only contains the relevant columns.
+```{r}
+clustering_data <- social_distancing[,c("stay_home", "large_gatherings", "restaurants")]
+clustering_data
+```
+
+Now let's try to identify the optimal number of clusters. We'll check from 1 to 15 clusters
+```{r}
+wss <- numeric(15)
+for (k in 1:15) wss[k] <- sum(kmeans(clustering_data, centers = k, nstart = 30)$withinss)
+plot(1:15, wss, type = "b", xlab = "Number of Clusters", ylab = "Within Sum of Squares")
+```
+
+```{r}
+km <- kmeans(clustering_data, 2, nstart = 25)
+km
+```
+
+Let's visualize our data. Since all points are likely to be on top of each other, we plot with some jitter.
+```{r}
+df <- as.data.frame(clustering_data)
+df$cluster <-  factor(km$cluster)
+centers <- as.data.frame(km$centers)
+
+shlg <- ggplot(data = df, aes(x = stay_home, y = large_gatherings, color = cluster)) +
+  geom_jitter() + theme(legend.position = "right") +
+  geom_point(data = centers, aes(x = stay_home, y = large_gatherings, color = as.factor(c(1,2))),
+             size = 10, alpha = .3, show.legend = FALSE)
+
+shr <- ggplot(data = df, aes(x = stay_home, y = restaurants, color = cluster)) +
+  geom_jitter() + theme(legend.position = "right") +
+  geom_point(data = centers, aes(x = stay_home, y = restaurants, color = as.factor(c(1,2))),
+             size = 10, alpha = .3, show.legend = FALSE)
+
+lgr <- ggplot(data = df, aes(y = large_gatherings, x = restaurants, color = cluster)) +
+  geom_jitter() + theme(legend.position = "right") +
+  geom_point(data = centers, aes(y = large_gatherings, x = restaurants, color = as.factor(c(1,2))),
+             size = 10, alpha = .3, show.legend = FALSE)
+
+grid.arrange(shlg + theme(legend.position = "none"), 
+             shr + theme(legend.position = "none"),
+             lgr + theme(legend.position = "none"),
+             top = "Social Distancing Clusters", ncol = 1)
+```
+
+This is very raw data (even graphed in it's "numerical" format despite being representative of categorical data), so we definitely won't include them in the final presentation. Still, they are illustrative in showing how well the clustering algorithm works, and if the clusters really are distinct. It appears that stay at home orders were the biggest dividing factor betwteen states, but restaurants and large gatherings maintained *some* predictive power as well. Let's add one more column to our dataset to differentiate between "More Strict" and "Less Strict" for "Social Distancing Mandates".
+
+```{r}
+if(km$centers[1] < km$centers[2]){
+  cluster_titles <- c('Less Strict', 'More Strict')
+} else {
+  cluster_titles <- c('More Strict', 'Less Strict')
+}
+
+identify_cluster <- function(num){
+  return(cluster_titles[num])
+}
+
+clustering_data$`Social Distancing Mandates` <- identify_cluster(km$cluster)
+clustering_data
+```
+
+Awesome! Now we have a decent classification of how strict each of the U.S. States have been with their statewide social distancing mandates, and we are ready to take this data and compare it to how well each state is doing in terms of cases and, especially, deaths. First, let's quickly visualize this data to see where each state ended up.
+```{r}
+plot_sd_data <- clustering_data %>%
+  rownames_to_column(var = 'state') %>%
+  rename(social_distancing = `Social Distancing Mandates`) %>%
+  right_join(states, by = c('state' = 'state_name'))
+
+sd_map <- ggplot(plot_sd_data, aes(map_id = tolower(state))) + 
+  geom_map(aes(fill = social_distancing), color = 'white', map = fifty_states) + 
+  expand_limits(x = fifty_states$long, y = fifty_states$lat) +
+  coord_map() +
+  labs(x = "", y = "", fill = 'Social Distancing') +
+  theme(legend.position = "bottom", 
+        panel.background = element_blank())
+
+ggsave('SocialDistancingMap.png')
+sd_map
+```
+```{r}
+states
+```
+
+
+# Cases and Deaths Data Source
+
+To obtain information regarding deaths and cases, we will use the Johns Hopkins data sources. Since our social distancing data was current as of May 12, we will use data from that same day for the sake of consistency.
+```{r}
+johns_hopkins_data <- as.data.frame(read_csv('https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_daily_reports/05-12-2020.csv'))
+```
+
+```{r}
+states_data <- johns_hopkins_data %>%
+  filter(Country_Region == 'US') %>%
+  select(Province_State, Confirmed, Deaths) %>%
+  group_by(Province_State) %>%
+  summarise(total_confirmed = sum(Confirmed),
+            total_deaths = sum(Deaths)) %>%
+  rename(state = Province_State)
+
+states_data
+```
+
+This data is interesting as is, but in order to be as honestly representative as possible of reality, we really want this data to be somehow relative to total population size in each state. Let's import the most recent data from the US Census Bureau about the population in each state and merge it with our other data.
+```{r}
+state_population <- as.data.frame(read_csv('https://www2.census.gov/programs-surveys/popest/datasets/2010-2019/state/detail/SCPRC-EST2019-18+POP-RES.csv'))
+state_population <- state_population %>%
+  filter(NAME != 'United States') %>%
+  filter(NAME != 'Puerto Rico Commonwealth') %>%
+  select(NAME, POPESTIMATE2019) %>%
+  rename(state = NAME, population = POPESTIMATE2019)
+state_population
+```
+
+```{r}
+states_data_per_thousand <- inner_join(states_data, state_population, by='state') %>%
+  mutate(confirmed_per_thousand = 1000 * total_confirmed / population,
+         deaths_per_thousand = 1000 * total_deaths / population)
+states_data_per_thousand
+```
+
+Awesome! Now we have data ready for both the social distancinng aspect of each state, and the cases and deaths for each state. It's time to put it all together and visualize what's going on here.
+
+# The Effects of Social Distancing Mandates on Coronavirus Cases and Deaths
+
+First, let's merge our two datsets so that we have one source to pull from for the rest of our analysis and visualization. We keep only the columns we need.
+```{r}
+sd_data <- rownames_to_column(clustering_data, var = 'state')
+combined_data <- inner_join(sd_data, states_data_per_thousand, by = 'state') %>%
+  select(state, `Social Distancing Mandates`, confirmed_per_thousand, deaths_per_thousand)
+
+combined_data
+```
+
+
+```{r}
+combined_data <- combined_data  %>%
+  rename(`Deaths (per thousand)` = deaths_per_thousand,
+         `Cases (per thousand)` = confirmed_per_thousand,
+         `Social Distancing` = `Social Distancing Mandates`) %>%
+  mutate(`Deaths (per thousand)` = round(`Deaths (per thousand)`,3),
+         `Cases (per thousand)` = round(`Cases (per thousand)`, 3),
+         text = paste('State: ', state,
+                      '\nCases (per thousand): ', `Cases (per thousand)`,
+                      '\nDeaths (per thousand): ', `Deaths (per thousand)`))
+```
+
+```{r}
+combined_data
+```
+
+We start by plotting deaths over cases, grouped by strictness of social distancing policies. Try hovering over these datapoints -- you can see which state each point belongs to, and the relevant metrics.
+
+```{r}
+scatter <- ggplot(combined_data, aes(x=`Cases (per thousand)`, y=`Deaths (per thousand)`,  text=text)) +
+  geom_point(aes(color=`Social Distancing`)) 
+
+ggsave('SocialDistancingScatter.png')
+interactive_scatter <- ggplotly(scatter, tooltip = 'text')
+htmlwidgets::saveWidget(interactive_scatter, 'SocialDistancingScatter_Interactive.html')
+interactive_scatter
+```
+
+It looks like there might be a difference in deaths per cases for each social distancing group, especially in the bottom left corner of our graph, where we have both groups plotted over a range of similar cases per thousand counts. Let's throw some regression lines onto our  data to see if this hypothesis holds any weight.
+
+```{r}
+lines <- ggplot(combined_data, aes(x=`Cases (per thousand)`, y=`Deaths (per thousand)`)) +
+  geom_point(aes(color=`Social Distancing`)) +
+  geom_smooth(method=lm, formula = y~x, se=FALSE, aes(color=`Social Distancing`)) +
+  geom_smooth(method=lm, formula = y~x, se=FALSE, color = 'darkgray')
+
+ggsave('SocialDistancingRegression.png')
+ggplotly(lines)
+```
+
+Yikes! In the plot above, the blue and red lines represent (respectively) the regression lines associated with the data for more strict and less strict states. The gray line is the regression for the entire dataset. But the gray line matches almost exactly with the blue line!! Why is this? Well, notice how far out from the rest of the data that the states are with the worst counts for cases and deaths. These massive outliers will absolutely dominating the regression, whether we are looking at a subset of the data or the entire thing. Since all of the outliers fall into the "More Strict" category, this causes the blue and gray lines to be very similar. (As an aside, it makes complete sense that all of the outlying states have more strict social distancing policies. *Of course* the states being impacted the most severely would be taking the greatest measures.)
+
+Let's take a quick peek at how many of these points can be classified as outliers, remove those from our dataset, and run a new regression.
+
+```{r}
+cases_boxplot <- boxplot(combined_data$`Cases (per thousand)`, 
+        horizontal = TRUE,
+        xlab = 'Cases (per thousand)',
+        main = 'Distribution of COVID-19 cases in the 50 states',
+        col = '#c288e3',
+        border = '#a18bad')
+
+deaths_boxplot <- boxplot(combined_data$`Deaths (per thousand)`, 
+        horizontal = TRUE,
+        xlab = 'Deaths (per thousand)',
+        main = 'Distribution of COVID-19 deaths in the 50 states',
+        col = '#ffe563',
+        border = '#b0ac9b')
+```
+
+```{r}
+combined_data$cases_rank <- rank(combined_data$`Cases (per thousand)`)
+combined_data$deaths_rank <- rank(combined_data$`Deaths (per thousand)`)
+no_outliers <- combined_data  %>%
+  filter(cases_rank <= 46) %>%
+  filter(deaths_rank <= 45)
+```
+```{r}
+less_lines <- ggplot(no_outliers, aes(x=`Cases (per thousand)`, y=`Deaths (per thousand)`)) +
+  geom_point(aes(color=`Social Distancing`)) +
+  geom_smooth(method=lm, formula = y~x, se=TRUE, aes(color=`Social Distancing`))
+
+ggsave('SocialDistancingRegression_NoOutliers.png')
+less_lines
+```
+
+This is interesting! It *does* appear that there may be a difference in slopes between our groups. We hesitate to make any broad claims about this without more rigorous statistical analysis, but for exploratory purposes it is at least thought-provoking. Even if it's interesting though, is this the right question to ask? The slopes here would represent *death rates* of COVID-19, in terms of people who have contracted the disease.
+
+[President Trump thinks that there's a more important measurement than death rates](https://khn.org/news/trumps-comparison-of-covid-19-death-rates-in-germany-us-is-wrong/): number of deaths relative to population size. It's not too hard for us to visualize that metric.
+
+```{r}
+boxes <- ggplot(combined_data, aes(x = `Social Distancing`, 
+                          y = `Deaths (per thousand)`, 
+                          fill = `Social Distancing`)) +
+  geom_boxplot(color = 'darkgray') +
+  ggtitle('COVID-19 Deaths, by strictness of statewide social distancing policies') +
+  theme(legend.title = element_text(size = 10.5))
+
+ggsave('SocialDistancingBoxplots.png')
+interactive_boxes <- ggplotly(boxes)
+htmlwidgets::saveWidget(interactive_boxes, 'SocialDistancingBoxplots_Interactive.html')
+interactive_boxes
+```
+
+At a glance, the only insight to be gathered from this graph is that there is much more variance in deaths per thousand among states with more strict social distancing policies. But go ahead, take advantage of the interactivity of this plot, and zoom in on the parts of the graph where our boxplots overlap. Looking closely, we see that little (if any) of the inner 50% of these two datasets is overlapping.
+
+We perform a rough (admittedly sloppy) test to see if there is a difference in mean deaths per thousand between our two groups. We start with a histogram to visualize normality.
+
+```{r}
+ggplot(combined_data, aes(x = `Deaths (per thousand)`, fill = `Social Distancing`)) +
+  geom_histogram(alpha = 0.6, color = 'gray')
+```
+Hmmmm... I would definitely want to do more rigorous analysis on the normality of this data. Potentially, it is adequately similar to a normal distribution, but (at least) the More Strict states are definitely right-skewed. We'll go ahead with the test, but keep in mind that our assumptions for this test have not beenn fully fleshed out.
+
+```{r}
+less_strict_deaths <- combined_data %>%
+  filter(`Social Distancing`=='Less Strict') %>%
+  select(`Deaths (per thousand)`)
+
+more_strict_deaths <- combined_data %>%
+  filter(`Social Distancing`=='More Strict') %>%
+  select(`Deaths (per thousand)`)
+
+t.test(less_strict_deaths, more_strict_deaths, alternative = 'two.sided', var.equal = FALSE)
+```
+
+Wowza, that's a tiny p-value! At any reasonable level of significance, this shows that the data suggests a difference in mean deaths per thousand between the two groups.
